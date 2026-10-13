@@ -4,6 +4,8 @@ pub mod config_cmd;
 pub mod ctx;
 pub mod live_cmd;
 pub mod sim_cmd;
+#[allow(dead_code)] // wired into the CLI by `lox stats` in the next commit
+pub mod stats_cmd;
 
 pub struct RunContext {
     pub json: bool,
