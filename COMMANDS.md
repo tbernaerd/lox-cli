@@ -226,7 +226,7 @@ lox sim dump file.Loxone -o json           # JSON output
 
 ## Statistics
 
-Reads the statistics the Miniserver logs to its SD card. Unlike the commands above, these need a live Miniserver connection (`lox setup`). All read-only.
+Reads the statistics the Miniserver logs to its SD card. These commands need a Miniserver connection (`lox setup`). All read-only.
 
 ```bash
 lox stats list                             # every statistic file: name, group, month, uuid, label
@@ -246,7 +246,7 @@ lox stats download --dir ./stats --dry-run # list what would be fetched
 
 `get` resolves the name case-insensitively (exact match first, then substring) or takes the uuid. A name shared by several statistics is reported as ambiguous with each uuid; a grouped statistic (e.g. a meter) needs `--group`, and the error lists the groups and their outputs. Timestamps are printed as the Miniserver writes them, without timezone conversion; the row a month file shares with the next month is printed once.
 
-`download` keeps existing files and always refetches the current month, which is still growing.
+`download` always refetches the current month, which is still growing. An existing file of an earlier month is kept only when it was saved at least one day after that month ended; an older copy may be incomplete and is refetched.
 
 ---
 

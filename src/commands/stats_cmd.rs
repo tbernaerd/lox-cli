@@ -10,9 +10,9 @@ use quick_xml::Reader;
 use quick_xml::escape::unescape;
 use quick_xml::events::{BytesStart, Event};
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::client::LoxClient;
 use crate::commands::RunContext;
@@ -21,6 +21,7 @@ use crate::config::Config;
 #[derive(Subcommand)]
 pub enum StatsCmd {
     /// List the statistics the Miniserver keeps: GET /stats/
+    #[command(alias = "ls")]
     List {
         /// Case-insensitive substring match on the label
         #[arg(long)]
@@ -96,14 +97,13 @@ pub fn cmd_stats(ctx: &RunContext, action: StatsCmd) -> Result<()> {
             to,
             force,
         } => {
-            let current_month = chrono::Local::now().format("%Y-%m").to_string();
             let opts = DownloadOpts {
                 dir,
                 filter,
                 range: MonthRange { from, to },
                 force,
             };
-            download(ctx, &lox, &opts, &current_month, &mut out)
+            download(ctx, &lox, &opts, chrono::Local::now(), &mut out)
         }
     }
 }
@@ -117,15 +117,18 @@ struct DownloadOpts {
 
 /// Mirror the monthly XML files into `opts.dir`.
 ///
-/// Existing files are skipped, except months at or after `current_month`
-/// (still growing on the Miniserver), unless `opts.force` is set (P6).
+/// Existing files of months before the current one are skipped when they
+/// were saved after that month ended (see [`is_final_copy`]); everything else
+/// is fetched. `opts.force` refetches every file (P6).
 fn download(
     ctx: &RunContext,
     lox: &LoxClient,
     opts: &DownloadOpts,
-    current_month: &str,
+    now: chrono::DateTime<chrono::Local>,
     out: &mut dyn Write,
 ) -> Result<()> {
+    opts.range.check()?;
+    let current_month = now.format("%Y-%m").to_string();
     let filter = opts.filter.as_deref().map(str::to_lowercase);
     let entries: Vec<StatEntry> = fetch_index(lox)?
         .into_iter()
@@ -140,8 +143,8 @@ fn download(
     let mut fetch = Vec::new();
     let mut skipped = Vec::new();
     for e in entries {
-        let exists = opts.dir.join(&e.file).is_file();
-        if exists && !opts.force && e.month.as_str() < current_month {
+        let path = opts.dir.join(&e.file);
+        if !opts.force && e.month < current_month && is_final_copy(&path, &e.month) {
             skipped.push(e.file);
         } else {
             fetch.push(e.file);
@@ -195,6 +198,32 @@ fn download(
     Ok(())
 }
 
+/// Whether the local file at `path` holds the complete data of `month`.
+///
+/// The Miniserver keeps appending to a month's file until the month is over,
+/// and the file gets the next month's first row at 02:00. A copy counts as
+/// final when it was saved at or after the first day of the following month
+/// plus one day (local time), which also absorbs clock skew. A missing file or
+/// unreadable modification time is never final.
+fn is_final_copy(path: &Path, month: &str) -> bool {
+    use chrono::TimeZone;
+    let Ok(first) = chrono::NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d") else {
+        return false;
+    };
+    let Some(cutoff) = first
+        .checked_add_months(chrono::Months::new(1))
+        .and_then(|d| d.succ_opt())
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .and_then(|d| chrono::Local.from_local_datetime(&d).earliest())
+    else {
+        return false;
+    };
+    let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) else {
+        return false;
+    };
+    chrono::DateTime::<chrono::Local>::from(modified) >= cutoff
+}
+
 /// Validate a `YYYY-MM` argument.
 fn parse_month(s: &str) -> std::result::Result<String, String> {
     chrono::NaiveDate::parse_from_str(&format!("{s}-01"), "%Y-%m-%d")
@@ -211,6 +240,16 @@ struct MonthRange {
 }
 
 impl MonthRange {
+    /// Reject a range whose start lies after its end.
+    fn check(&self) -> Result<()> {
+        if let (Some(from), Some(to)) = (&self.from, &self.to)
+            && from > to
+        {
+            bail!("--from {from} is later than --to {to}");
+        }
+        Ok(())
+    }
+
     fn contains(&self, month: &str) -> bool {
         self.from.as_deref().is_none_or(|f| month >= f)
             && self.to.as_deref().is_none_or(|t| month <= t)
@@ -220,7 +259,7 @@ impl MonthRange {
 /// One file listed in the `/stats/` index.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct StatEntry {
-    /// File name as served, e.g. `1e50..._2.202610.xml`
+    /// File name as served, e.g. `0a1b2c3d-4e5f-6a7b-8c9d0e1f2a3b4c5d_2.202610.xml`
     pub file: String,
     pub uuid: String,
     pub group: Option<u32>,
@@ -290,8 +329,7 @@ fn list(
         .filter(|e| month.is_none_or(|m| e.month == m))
         .collect();
     if latest {
-        let mut newest: std::collections::HashMap<(String, Option<u32>), String> =
-            std::collections::HashMap::new();
+        let mut newest: HashMap<(String, Option<u32>), String> = HashMap::new();
         for e in &entries {
             let m = newest.entry((e.uuid.clone(), e.group)).or_default();
             if e.month > *m {
@@ -403,6 +441,7 @@ fn get(
     range: &MonthRange,
     out: &mut dyn Write,
 ) -> Result<()> {
+    range.check()?;
     let index = fetch_index(lox)?;
     let matches = resolve(&index, query)?;
     let name = matches[0].name.clone();
@@ -460,9 +499,9 @@ fn get(
 
     let parts = selected
         .iter()
-        .map(|e| fetch_series(lox, e))
+        .map(|e| Ok((e.month.clone(), fetch_series(lox, e)?)))
         .collect::<Result<Vec<_>>>()?;
-    let series = merge_months(parts);
+    let series = merge_months(parts)?;
     write_series(ctx, &series, out)
 }
 
@@ -577,18 +616,21 @@ pub fn parse_index(html: &str) -> Vec<StatEntry> {
     let mut rest = html;
     while let Some(pos) = rest.find("<li>") {
         rest = &rest[pos + 4..];
-        let Some(after) = rest.trim_start().strip_prefix("<a href=\"") else {
+        // Parse within this entry only, so a malformed entry is skipped
+        // without consuming the next one.
+        let item = rest.find("<li>").map_or(rest, |end| &rest[..end]);
+        let Some(after) = item.trim_start().strip_prefix("<a href=\"") else {
             continue;
         };
         let Some((href, after)) = after.split_once('"') else {
-            break;
+            continue;
         };
         let Some(gt) = after.find('>') else {
-            break;
+            continue;
         };
         let after = &after[gt + 1..];
         let Some((raw_label, _)) = after.split_once("</a>") else {
-            break;
+            continue;
         };
         let Some((uuid, group, month)) = parse_file_name(href) else {
             continue;
@@ -705,20 +747,32 @@ pub fn parse_series(xml: &str) -> Result<StatSeries> {
 
 /// Concatenate month files (in month order) into one series.
 ///
-/// A month file can end with the first timestamp of the next month; rows whose
-/// timestamp was already emitted by an earlier month are dropped (P5).
-pub fn merge_months(parts: Vec<StatSeries>) -> StatSeries {
+/// Each part is `(month, series)`. A month file can end with the first
+/// timestamp of the next month; rows whose timestamp was already emitted by an
+/// earlier month are dropped (P5). Months whose outputs differ cannot be
+/// combined into one table and are an error.
+pub fn merge_months(parts: Vec<(String, StatSeries)>) -> Result<StatSeries> {
     let mut parts = parts.into_iter();
-    let Some(mut merged) = parts.next() else {
-        return StatSeries {
+    let Some((mut prev_month, mut merged)) = parts.next() else {
+        return Ok(StatSeries {
             name: String::new(),
             group: None,
             outputs: Vec::new(),
             rows: Vec::new(),
-        };
+        });
     };
     let mut seen: HashSet<String> = merged.rows.iter().map(|(t, _)| t.clone()).collect();
-    for part in parts {
+    for (month, part) in parts {
+        if part.outputs != merged.outputs {
+            bail!(
+                "Statistic '{}' has different outputs in {prev_month} ({}) and {month} ({}); \
+                 use --from/--to to select months with the same outputs",
+                merged.name,
+                merged.outputs.join(", "),
+                part.outputs.join(", ")
+            );
+        }
+        prev_month = month;
         let fresh: Vec<_> = part
             .rows
             .into_iter()
@@ -727,7 +781,7 @@ pub fn merge_months(parts: Vec<StatSeries>) -> StatSeries {
         seen.extend(fresh.iter().map(|(t, _)| t.clone()));
         merged.rows.extend(fresh);
     }
-    merged
+    Ok(merged)
 }
 
 #[cfg(test)]
@@ -745,7 +799,7 @@ mod tests {
 <li><a href="1a2b3c4d-0003-0004-ffffabcdef012345.2026.xml">Short month 2026</a></li>
 <li><a href="1a2b3c4d-0001-0002-ffff0123456789ab_x.202609.xml">Bad group 202609</a></li>
 <li><a href="styles.css">styles.css</a></li>
-<li><a href="1a2b3c4d-0001-0002-ffff0123456789ab_1.202610.xml">Fotovolta&#xEF;ek &amp; Co (Statistic Group: 1) (Energy, Roof) 202610</a></li>
+<li><a href="1a2b3c4d-0001-0002-ffff0123456789ab_1.202610.xml">Caf&#xE9; &amp; Bar (Statistic Group: 1) (Energy, Terrace) 202610</a></li>
 </ul></body></html>"#;
 
     // ── parse_index ──────────────────────────────────────────────────────────
@@ -777,10 +831,10 @@ mod tests {
                 label: "Kitchen (Climate, Kitchen)".into(),
             }
         );
-        assert_eq!(entries[2].name, "Fotovoltaïek & Co");
+        assert_eq!(entries[2].name, "Café & Bar");
         assert_eq!(
             entries[2].label,
-            "Fotovoltaïek & Co (Statistic Group: 1) (Energy, Roof)"
+            "Café & Bar (Statistic Group: 1) (Energy, Terrace)"
         );
         assert_eq!(entries[2].group, Some(1));
     }
@@ -796,6 +850,28 @@ mod tests {
         );
         assert!(!entries.iter().any(|e| e.file == "styles.css"));
         assert!(!entries.iter().any(|e| e.name == "Broken"));
+    }
+
+    #[test]
+    fn index_skips_malformed_entry_and_continues() {
+        let html = format!(
+            "<ul>\n\
+             <li><a href=\"{UUID_B}.202609.xml\">Kitchen (Climate, Kitchen) 202609</a></li>\n\
+             <li><a href=\"{UUID_B}.202610.xml\">Kitchen (Climate, Kitchen) 202610</li>\n\
+             <li><a href=\"{UUID_B}.202611.xml>Kitchen (Climate, Kitchen) 202611</a></li>\n\
+             <li><a href=\"{UUID_A}_1.202610.xml\">Heat Pump (Statistic Group: 1) 202610</a></li>\n\
+             </ul>"
+        );
+        let entries = parse_index(&html);
+        let files: Vec<&str> = entries.iter().map(|e| e.file.as_str()).collect();
+        assert_eq!(
+            files,
+            vec![
+                format!("{UUID_B}.202609.xml"),
+                format!("{UUID_A}_1.202610.xml")
+            ]
+        );
+        assert_eq!(entries[1].label, "Heat Pump (Statistic Group: 1)");
     }
 
     // ── parse_series ─────────────────────────────────────────────────────────
@@ -873,7 +949,7 @@ mod tests {
     fn merge_drops_boundary_duplicate_and_keeps_month_order() {
         let sep = series(&[("2026-09-30 23:00:00", 1.0), ("2026-10-01 02:00:00", 2.0)]);
         let oct = series(&[("2026-10-01 02:00:00", 2.0), ("2026-10-01 03:00:00", 3.0)]);
-        let m = merge_months(vec![sep, oct]);
+        let m = merge_months(vec![("2026-09".into(), sep), ("2026-10".into(), oct)]).unwrap();
         assert_eq!(m.name, "Heat Pump");
         assert_eq!(m.group, Some(1));
         assert_eq!(m.outputs, vec!["Consumed"]);
@@ -903,7 +979,7 @@ mod tests {
     }
 
     /// Index: Heat Pump groups 1 (2026-10) and 2 (2026-08..2026-11),
-    /// Kitchen ungrouped (2026-09, 2026-10), two different "Other" statistics.
+    /// Kitchen ungrouped (2026-09, 2026-10), two different "Spare Circuit" statistics.
     fn mock_index() -> String {
         let mut html = String::from(
             "<html><head><link href=\"styles.css\" rel=\"stylesheet\"></head><body><ul>\n",
@@ -926,11 +1002,11 @@ mod tests {
         }
         html += &li(
             &format!("{OTHER_1}.202610.xml"),
-            "Other (Climate, Attic) 202610",
+            "Spare Circuit (Climate, Attic) 202610",
         );
         html += &li(
             &format!("{OTHER_2}.202610.xml"),
-            "Other (Energy, Garage) 202610",
+            "Spare Circuit (Energy, Garage) 202610",
         );
         html + "</ul></body></html>"
     }
@@ -1079,10 +1155,17 @@ mod tests {
     fn get_ambiguous_name_lists_both_uuids() {
         let server = MockServer::start();
         serve_index(&server);
-        let err = run_get(&server, &run_ctx(false, false), "other", None, None, None)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("Ambiguous: 'other'"), "{err}");
+        let err = run_get(
+            &server,
+            &run_ctx(false, false),
+            "spare circuit",
+            None,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Ambiguous: 'spare circuit'"), "{err}");
         assert!(err.contains(OTHER_1) && err.contains(OTHER_2), "{err}");
     }
 
@@ -1116,20 +1199,137 @@ mod tests {
     }
 
     #[test]
-    fn get_unknown_name_is_not_found() {
+    fn get_unknown_name_suggests_near_miss() {
         let server = MockServer::start();
         serve_index(&server);
+        let err = run_get(&server, &run_ctx(false, false), "Kitchn", None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Statistic 'Kitchn' not found"), "{err}");
+        assert!(err.contains("Did you mean: Kitchen?"), "{err}");
+    }
+
+    fn serve_body<'a>(server: &'a MockServer, body: String) -> httpmock::Mock<'a> {
+        server.mock(move |when, then| {
+            when.method(GET).path("/stats/");
+            then.status(200).body(body);
+        })
+    }
+
+    fn kitchen_xml(rows: &[(&str, f64)]) -> String {
+        let mut xml = String::from(
+            "<Statistics Name=\"Kitchen\" NumOutputs=\"1\" Outputs=\"Temperature\">\n",
+        );
+        for (t, v) in rows {
+            xml += &format!("<S T=\"{t}\" V=\"{v}\"/>\n");
+        }
+        xml + "</Statistics>"
+    }
+
+    #[test]
+    fn get_index_out_of_order_still_prints_chronologically() {
+        let server = MockServer::start();
+        serve_body(
+            &server,
+            format!(
+                "<html><body><ul>\n{}{}</ul></body></html>",
+                li(
+                    &format!("{KITCHEN}.202610.xml"),
+                    "Kitchen (Climate, Kitchen) 202610"
+                ),
+                li(
+                    &format!("{KITCHEN}.202609.xml"),
+                    "Kitchen (Climate, Kitchen) 202609"
+                ),
+            ),
+        );
+        serve_file(
+            &server,
+            &format!("{KITCHEN}.202609.xml"),
+            &kitchen_xml(&[("2026-09-30 23:30:00", 21.5), ("2026-10-01 00:00:00", 21.0)]),
+        );
+        serve_file(
+            &server,
+            &format!("{KITCHEN}.202610.xml"),
+            &kitchen_xml(&[("2026-10-01 00:00:00", 21.0), ("2026-10-01 00:30:00", 20.5)]),
+        );
+        let out = run_get(&server, &run_ctx(false, true), "Kitchen", None, None, None).unwrap();
+        assert_eq!(
+            out,
+            "T,Temperature\n\
+             2026-09-30 23:30:00,21.5\n\
+             2026-10-01 00:00:00,21\n\
+             2026-10-01 00:30:00,20.5\n"
+        );
+    }
+
+    #[test]
+    fn get_months_with_different_outputs_is_error() {
+        let server = MockServer::start();
+        serve_index(&server);
+        serve_file(
+            &server,
+            &format!("{KITCHEN}.202609.xml"),
+            &kitchen_xml(&[("2026-09-30 23:30:00", 21.5)]),
+        );
+        serve_file(
+            &server,
+            &format!("{KITCHEN}.202610.xml"),
+            r#"<Statistics Name="Kitchen" NumOutputs="2" Outputs="Temperature,Humidity">
+<S T="2026-10-01 00:30:00" V="21" V2="50.5"/>
+</Statistics>"#,
+        );
+        let err = run_get(&server, &run_ctx(false, true), "Kitchen", None, None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("'Kitchen'"), "{err}");
+        assert!(err.contains("2026-09 (Temperature)"), "{err}");
+        assert!(err.contains("2026-10 (Temperature, Humidity)"), "{err}");
+        assert!(err.contains("--from/--to"), "{err}");
+    }
+
+    #[test]
+    fn get_csv_no_header_omits_header() {
+        let server = MockServer::start();
+        serve_index(&server);
+        serve_file(
+            &server,
+            &format!("{KITCHEN}.202610.xml"),
+            &kitchen_xml(&[("2026-10-01 00:00:00", 21.0)]),
+        );
+        let mut ctx = run_ctx(false, true);
+        ctx.no_header = true;
+        let out = run_get(
+            &server,
+            &ctx,
+            "Kitchen",
+            None,
+            Some("2026-10"),
+            Some("2026-10"),
+        )
+        .unwrap();
+        assert_eq!(out, "2026-10-01 00:00:00,21\n");
+    }
+
+    #[test]
+    fn get_from_after_to_is_error_without_requests() {
+        let server = MockServer::start();
+        let index = serve_index(&server);
         let err = run_get(
             &server,
             &run_ctx(false, false),
-            "Garage Door",
+            "Kitchen",
             None,
-            None,
-            None,
+            Some("2026-10"),
+            Some("2026-09"),
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("Statistic 'Garage Door' not found"), "{err}");
+        assert!(
+            err.contains("--from 2026-10 is later than --to 2026-09"),
+            "{err}"
+        );
+        index.assert_hits(0);
     }
 
     #[test]
@@ -1184,6 +1384,24 @@ mod tests {
     }
 
     #[test]
+    fn list_table_no_header_omits_header() {
+        let server = MockServer::start();
+        serve_index(&server);
+        let lox = mock_client(&server);
+        let mut ctx = run_ctx(false, false);
+        let mut with_header = Vec::new();
+        list(&ctx, &lox, None, None, false, &mut with_header).unwrap();
+        let with_header = String::from_utf8(with_header).unwrap();
+        assert!(with_header.starts_with("NAME"), "{with_header}");
+        ctx.no_header = true;
+        let mut out = Vec::new();
+        list(&ctx, &lox, None, None, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("NAME"), "{out}");
+        assert_eq!(out.lines().count(), 9, "{out}");
+    }
+
+    #[test]
     fn list_latest_keeps_newest_month_per_uuid_and_group() {
         let server = MockServer::start();
         serve_index(&server);
@@ -1203,7 +1421,27 @@ mod tests {
 
     // ── download (httpmock + tempdir) ────────────────────────────────────────
 
-    const CURRENT: &str = "2026-10";
+    /// The injected "now" for download tests: mid-October 2026, local time.
+    fn now() -> chrono::DateTime<chrono::Local> {
+        local(2026, 10, 15, 12)
+    }
+
+    fn local(y: i32, m: u32, d: u32, h: u32) -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone;
+        chrono::Local
+            .with_ymd_and_hms(y, m, d, h, 0, 0)
+            .earliest()
+            .unwrap()
+    }
+
+    fn set_mtime(path: &std::path::Path, t: chrono::DateTime<chrono::Local>) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t.into())
+            .unwrap();
+    }
 
     /// Kitchen 2026-09 (past) and 2026-10 (current), Heat Pump group 1 2026-10.
     fn download_index() -> String {
@@ -1266,7 +1504,7 @@ mod tests {
             force,
         };
         let mut out = Vec::new();
-        download(&ctx, &lox, &opts, CURRENT, &mut out).unwrap();
+        download(&ctx, &lox, &opts, now(), &mut out).unwrap();
         String::from_utf8(out).unwrap()
     }
 
@@ -1302,6 +1540,76 @@ mod tests {
         mocks.kitchen_sep.assert_hits(1);
         mocks.kitchen_oct.assert_hits(2);
         mocks.heat_pump_oct.assert_hits(2);
+    }
+
+    #[test]
+    fn download_refetches_past_month_saved_before_month_end() {
+        let server = MockServer::start();
+        let mocks = serve_download(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        run_download(&server, tmp.path(), false, false);
+        set_mtime(
+            &tmp.path().join(format!("{KITCHEN}.202609.xml")),
+            local(2026, 9, 30, 12),
+        );
+        let out = run_download(&server, tmp.path(), false, false);
+        assert!(out.contains("3 downloaded, 0 skipped"), "{out}");
+        mocks.kitchen_sep.assert_hits(2);
+    }
+
+    #[test]
+    fn download_refetches_past_month_saved_on_first_day_of_next_month() {
+        let server = MockServer::start();
+        let mocks = serve_download(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        run_download(&server, tmp.path(), false, false);
+        set_mtime(
+            &tmp.path().join(format!("{KITCHEN}.202609.xml")),
+            local(2026, 10, 1, 23),
+        );
+        let out = run_download(&server, tmp.path(), false, false);
+        assert!(out.contains("3 downloaded, 0 skipped"), "{out}");
+        mocks.kitchen_sep.assert_hits(2);
+    }
+
+    #[test]
+    fn download_skips_past_month_saved_after_month_end_plus_one_day() {
+        let server = MockServer::start();
+        let mocks = serve_download(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        run_download(&server, tmp.path(), false, false);
+        set_mtime(
+            &tmp.path().join(format!("{KITCHEN}.202609.xml")),
+            local(2026, 10, 2, 0),
+        );
+        let out = run_download(&server, tmp.path(), false, false);
+        assert!(out.contains("2 downloaded, 1 skipped"), "{out}");
+        mocks.kitchen_sep.assert_hits(1);
+    }
+
+    #[test]
+    fn download_from_after_to_is_error_without_requests() {
+        let server = MockServer::start();
+        let mocks = serve_download(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        let lox = mock_client(&server);
+        let opts = DownloadOpts {
+            dir: tmp.path().to_path_buf(),
+            filter: None,
+            range: MonthRange {
+                from: Some("2026-10".into()),
+                to: Some("2026-09".into()),
+            },
+            force: false,
+        };
+        let err = download(&run_ctx(false, false), &lox, &opts, now(), &mut Vec::new())
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("--from 2026-10 is later than --to 2026-09"),
+            "{err}"
+        );
+        mocks.kitchen_sep.assert_hits(0);
     }
 
     #[test]
