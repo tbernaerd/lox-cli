@@ -10,7 +10,6 @@ pub struct RunContext {
     pub json: bool,
     pub quiet: bool,
     pub csv: bool,
-    #[allow(dead_code)]
     pub dry_run: bool,
     pub no_header: bool,
     #[allow(dead_code)]

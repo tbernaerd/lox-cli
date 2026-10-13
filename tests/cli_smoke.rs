@@ -74,6 +74,7 @@ subcmd_help!(help_color_decode, "color", "decode");
 subcmd_help!(help_stats, "stats");
 subcmd_help!(help_stats_list, "stats", "list");
 subcmd_help!(help_stats_get, "stats", "get");
+subcmd_help!(help_stats_download, "stats", "download");
 
 // ── color encode/decode functional ─────────────────────────────────────────
 

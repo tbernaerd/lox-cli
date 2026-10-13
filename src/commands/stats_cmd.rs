@@ -12,6 +12,7 @@ use quick_xml::events::{BytesStart, Event};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::Write;
+use std::path::PathBuf;
 
 use crate::client::LoxClient;
 use crate::commands::RunContext;
@@ -45,6 +46,24 @@ pub enum StatsCmd {
         #[arg(long, value_parser = parse_month)]
         to: Option<String>,
     },
+    /// Mirror the raw monthly XML files into a folder (incremental)
+    Download {
+        /// Target folder (created when missing)
+        #[arg(long)]
+        dir: PathBuf,
+        /// Case-insensitive substring match on the label
+        #[arg(long)]
+        filter: Option<String>,
+        /// First month to include (YYYY-MM, inclusive)
+        #[arg(long, value_parser = parse_month)]
+        from: Option<String>,
+        /// Last month to include (YYYY-MM, inclusive)
+        #[arg(long, value_parser = parse_month)]
+        to: Option<String>,
+        /// Refetch files that already exist locally
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 pub fn cmd_stats(ctx: &RunContext, action: StatsCmd) -> Result<()> {
@@ -70,7 +89,110 @@ pub fn cmd_stats(ctx: &RunContext, action: StatsCmd) -> Result<()> {
             from,
             to,
         } => get(ctx, &lox, &name, group, &MonthRange { from, to }, &mut out),
+        StatsCmd::Download {
+            dir,
+            filter,
+            from,
+            to,
+            force,
+        } => {
+            let current_month = chrono::Local::now().format("%Y-%m").to_string();
+            let opts = DownloadOpts {
+                dir,
+                filter,
+                range: MonthRange { from, to },
+                force,
+            };
+            download(ctx, &lox, &opts, &current_month, &mut out)
+        }
     }
+}
+
+struct DownloadOpts {
+    dir: PathBuf,
+    filter: Option<String>,
+    range: MonthRange,
+    force: bool,
+}
+
+/// Mirror the monthly XML files into `opts.dir`.
+///
+/// Existing files are skipped, except months at or after `current_month`
+/// (still growing on the Miniserver), unless `opts.force` is set (P6).
+fn download(
+    ctx: &RunContext,
+    lox: &LoxClient,
+    opts: &DownloadOpts,
+    current_month: &str,
+    out: &mut dyn Write,
+) -> Result<()> {
+    let filter = opts.filter.as_deref().map(str::to_lowercase);
+    let entries: Vec<StatEntry> = fetch_index(lox)?
+        .into_iter()
+        .filter(|e| {
+            filter
+                .as_deref()
+                .is_none_or(|f| e.label.to_lowercase().contains(f))
+        })
+        .filter(|e| opts.range.contains(&e.month))
+        .collect();
+
+    let mut fetch = Vec::new();
+    let mut skipped = Vec::new();
+    for e in entries {
+        let exists = opts.dir.join(&e.file).is_file();
+        if exists && !opts.force && e.month.as_str() < current_month {
+            skipped.push(e.file);
+        } else {
+            fetch.push(e.file);
+        }
+    }
+
+    if ctx.dry_run {
+        if ctx.json {
+            let doc = serde_json::json!({
+                "dry_run": true,
+                "would_download": fetch,
+                "skipped": skipped,
+            });
+            writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
+        } else {
+            for f in &fetch {
+                writeln!(out, "{f}")?;
+            }
+            if !ctx.quiet {
+                writeln!(
+                    out,
+                    "{} would be downloaded, {} skipped (dry run)",
+                    fetch.len(),
+                    skipped.len()
+                )?;
+            }
+        }
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&opts.dir)
+        .with_context(|| format!("creating {}", opts.dir.display()))?;
+    for f in &fetch {
+        let bytes = lox
+            .get_bytes(&format!("/stats/{f}"))
+            .with_context(|| format!("reading {f}"))?;
+        // Write via a temp file so an interrupted run never leaves a truncated
+        // file behind that a later run would skip as complete.
+        let target = opts.dir.join(f);
+        let part = opts.dir.join(format!("{f}.part"));
+        std::fs::write(&part, &bytes).with_context(|| format!("writing {}", part.display()))?;
+        std::fs::rename(&part, &target).with_context(|| format!("writing {}", target.display()))?;
+    }
+
+    if ctx.json {
+        let doc = serde_json::json!({ "downloaded": fetch, "skipped": skipped });
+        writeln!(out, "{}", serde_json::to_string_pretty(&doc)?)?;
+    } else if !ctx.quiet {
+        writeln!(out, "{} downloaded, {} skipped", fetch.len(), skipped.len())?;
+    }
+    Ok(())
 }
 
 /// Validate a `YYYY-MM` argument.
@@ -1077,5 +1199,136 @@ mod tests {
                 format!("{OTHER_2}.202610.xml"),
             ]
         );
+    }
+
+    // ── download (httpmock + tempdir) ────────────────────────────────────────
+
+    const CURRENT: &str = "2026-10";
+
+    /// Kitchen 2026-09 (past) and 2026-10 (current), Heat Pump group 1 2026-10.
+    fn download_index() -> String {
+        format!(
+            "<html><body><ul>\n{}{}{}</ul></body></html>",
+            li(
+                &format!("{KITCHEN}.202609.xml"),
+                "Kitchen (Climate, Kitchen) 202609"
+            ),
+            li(
+                &format!("{KITCHEN}.202610.xml"),
+                "Kitchen (Climate, Kitchen) 202610"
+            ),
+            li(
+                &format!("{HP}_1.202610.xml"),
+                "Heat Pump (Statistic Group: 1) (Energy, Utility Room) 202610"
+            ),
+        )
+    }
+
+    struct DownloadMocks<'a> {
+        kitchen_sep: httpmock::Mock<'a>,
+        kitchen_oct: httpmock::Mock<'a>,
+        heat_pump_oct: httpmock::Mock<'a>,
+    }
+
+    fn serve_download(server: &MockServer) -> DownloadMocks<'_> {
+        let index = download_index();
+        server.mock(move |when, then| {
+            when.method(GET).path("/stats/");
+            then.status(200).body(index);
+        });
+        DownloadMocks {
+            kitchen_sep: serve_file(server, &format!("{KITCHEN}.202609.xml"), "<sep/>\r\n"),
+            kitchen_oct: serve_file(server, &format!("{KITCHEN}.202610.xml"), "<oct/>"),
+            heat_pump_oct: serve_file(
+                server,
+                &format!("{HP}_1.202610.xml"),
+                &heat_pump_xml(1, "2026-10-01 02:00:00"),
+            ),
+        }
+    }
+
+    fn run_download(
+        server: &MockServer,
+        dir: &std::path::Path,
+        force: bool,
+        dry_run: bool,
+    ) -> String {
+        let lox = mock_client(server);
+        let mut ctx = run_ctx(false, false);
+        ctx.dry_run = dry_run;
+        let opts = DownloadOpts {
+            dir: dir.to_path_buf(),
+            filter: None,
+            range: MonthRange {
+                from: None,
+                to: None,
+            },
+            force,
+        };
+        let mut out = Vec::new();
+        download(&ctx, &lox, &opts, CURRENT, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn download_first_run_writes_all_files() {
+        let server = MockServer::start();
+        let mocks = serve_download(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("stats");
+        let out = run_download(&server, &dir, false, false);
+        assert!(out.contains("3 downloaded, 0 skipped"), "{out}");
+        mocks.kitchen_sep.assert_hits(1);
+        mocks.kitchen_oct.assert_hits(1);
+        mocks.heat_pump_oct.assert_hits(1);
+        assert_eq!(
+            std::fs::read(dir.join(format!("{KITCHEN}.202609.xml"))).unwrap(),
+            b"<sep/>\r\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(format!("{HP}_1.202610.xml"))).unwrap(),
+            heat_pump_xml(1, "2026-10-01 02:00:00")
+        );
+    }
+
+    #[test]
+    fn download_second_run_refetches_only_current_month() {
+        let server = MockServer::start();
+        let mocks = serve_download(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        run_download(&server, tmp.path(), false, false);
+        let out = run_download(&server, tmp.path(), false, false);
+        assert!(out.contains("2 downloaded, 1 skipped"), "{out}");
+        mocks.kitchen_sep.assert_hits(1);
+        mocks.kitchen_oct.assert_hits(2);
+        mocks.heat_pump_oct.assert_hits(2);
+    }
+
+    #[test]
+    fn download_force_refetches_everything() {
+        let server = MockServer::start();
+        let mocks = serve_download(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        run_download(&server, tmp.path(), false, false);
+        let out = run_download(&server, tmp.path(), true, false);
+        assert!(out.contains("3 downloaded, 0 skipped"), "{out}");
+        mocks.kitchen_sep.assert_hits(2);
+        mocks.kitchen_oct.assert_hits(2);
+        mocks.heat_pump_oct.assert_hits(2);
+    }
+
+    #[test]
+    fn download_dry_run_makes_no_file_requests() {
+        let server = MockServer::start();
+        let mocks = serve_download(&server);
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("stats");
+        let out = run_download(&server, &dir, false, true);
+        mocks.kitchen_sep.assert_hits(0);
+        mocks.kitchen_oct.assert_hits(0);
+        mocks.heat_pump_oct.assert_hits(0);
+        assert!(!dir.exists(), "dry run must not create the folder");
+        assert!(out.contains(&format!("{KITCHEN}.202609.xml")), "{out}");
+        assert!(out.contains("3 would be downloaded, 0 skipped"), "{out}");
     }
 }
