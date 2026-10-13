@@ -71,6 +71,9 @@ subcmd_help!(help_telemetry, "telemetry");
 subcmd_help!(help_color, "color");
 subcmd_help!(help_color_encode, "color", "encode");
 subcmd_help!(help_color_decode, "color", "decode");
+subcmd_help!(help_stats, "stats");
+subcmd_help!(help_stats_list, "stats", "list");
+subcmd_help!(help_stats_get, "stats", "get");
 
 // ── color encode/decode functional ─────────────────────────────────────────
 
